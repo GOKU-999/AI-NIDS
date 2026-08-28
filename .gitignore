@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Model files (optional - can be large)
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# Data files (optional - can be large)
+data/raw/
+data/processed/
+*.csv
+
+# Node.js / Frontend
+frontend/node_modules/
+frontend/.env
+frontend/build/
+frontend/.DS_Store
+
+# Backend
+*.log
+.env
+.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+*.key
+*.crt
