@@ -1,7 +1,7 @@
 """
 ======================================================================
 AI-NIDS — FastAPI Inference Service
-PHASE 11
+PHASE 11 — GitHub + Google Drive Deployment Version
 
 Architecture:
 
@@ -23,25 +23,29 @@ Binary Random Forest
               v
          Attack Type
 
-Run from project root:
+The large Random Forest .joblib files are downloaded automatically
+from Google Drive when they are not available locally.
 
-    python -m uvicorn ml-service.src.api:app --reload
+Run locally:
 
-Or from ml-service/src:
+    cd ml-service
+    python src/api.py
 
-    uvicorn api:app --reload
+Or:
+
+    uvicorn src.api:app --host 0.0.0.0 --port 8000
 ======================================================================
 """
 
 from pathlib import Path
 import json
-import sys
 import time
 from typing import Dict, List
 
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,46 +59,78 @@ from schemas import (
 
 
 # ======================================================================
+# CONFIGURATION
+# ======================================================================
+
+APP_VERSION = "1.0.0"
+
+EXPECTED_FEATURE_COUNT = 50
+
+# ----------------------------------------------------------------------
+# Google Drive model IDs
+# ----------------------------------------------------------------------
+# Binary model:
+# 1nT-GtoBTuzwBxnTNYSsm8VliOjPsahj4
+#
+# Multi-class model:
+# 1sNFCe39nc_txzra7p3fScMGvEaMoUVae
+#
+# IMPORTANT:
+# These files must be shared as:
+# "Anyone with the link → Viewer"
+# ----------------------------------------------------------------------
+
+BINARY_FILE_ID = "1nT-GtoBTuzwBxnTNYSsm8VliOjPsahj4"
+
+MULTICLASS_FILE_ID = "1sNFCe39nc_txzra7p3fScMGvEaMoUVae"
+
+
+# ======================================================================
 # PATH CONFIGURATION
 # ======================================================================
 
 CURRENT_FILE = Path(__file__).resolve()
 
-# ml-service/src/api.py
-#          ^
-#          └── ml-service
+# api.py
+#   ↓
+# src
+#   ↓
+# ml-service
 BASE_DIR = CURRENT_FILE.parent.parent
 
 MODELS_DIR = BASE_DIR / "models"
 
+BINARY_DIR = MODELS_DIR / "binary"
+MULTICLASS_DIR = MODELS_DIR / "multiclass"
+
+
 BINARY_MODEL_PATH = (
-    MODELS_DIR
-    / "binary"
-    / "random_forest_binary.joblib"
+    BINARY_DIR / "random_forest_binary.joblib"
 )
 
 BINARY_FEATURES_PATH = (
-    MODELS_DIR
-    / "binary"
-    / "feature_names.json"
+    BINARY_DIR / "feature_names.json"
 )
 
+BINARY_METRICS_PATH = (
+    BINARY_DIR / "metrics.json"
+)
+
+
 MULTICLASS_MODEL_PATH = (
-    MODELS_DIR
-    / "multiclass"
-    / "random_forest_multiclass.joblib"
+    MULTICLASS_DIR / "random_forest_multiclass.joblib"
 )
 
 MULTICLASS_FEATURES_PATH = (
-    MODELS_DIR
-    / "multiclass"
-    / "feature_names.json"
+    MULTICLASS_DIR / "feature_names.json"
 )
 
-LABEL_MAPPING_PATH = (
-    MODELS_DIR
-    / "multiclass"
-    / "label_mapping.json"
+MULTICLASS_LABEL_MAPPING_PATH = (
+    MULTICLASS_DIR / "label_mapping.json"
+)
+
+MULTICLASS_METRICS_PATH = (
+    MULTICLASS_DIR / "metrics.json"
 )
 
 
@@ -105,10 +141,10 @@ LABEL_MAPPING_PATH = (
 app = FastAPI(
     title="AI-NIDS API",
     description=(
-        "AI-powered Network Intrusion Detection System using "
-        "a two-stage Random Forest architecture."
+        "AI-powered Network Intrusion Detection System "
+        "using a two-stage Random Forest architecture."
     ),
-    version="1.0.0",
+    version=APP_VERSION,
 )
 
 
@@ -130,93 +166,404 @@ app.add_middleware(
 # ======================================================================
 
 binary_model = None
+
 multiclass_model = None
 
 binary_features: List[str] = []
+
 multiclass_features: List[str] = []
 
 label_mapping: Dict[str, str] = {}
 
 
 # ======================================================================
-# UTILITY FUNCTIONS
+# GOOGLE DRIVE DOWNLOAD
+# ======================================================================
+
+def download_from_google_drive(
+    file_id: str,
+    destination: Path,
+) -> None:
+    """
+    Download a file from Google Drive.
+
+    This is used only when the model file does not already exist.
+    """
+
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print()
+    print("=" * 70)
+    print("DOWNLOADING MODEL FROM GOOGLE DRIVE")
+    print("=" * 70)
+
+    print(f"Destination:")
+    print(f"  {destination}")
+
+    url = (
+        "https://drive.google.com/uc"
+        f"?export=download&id={file_id}"
+    )
+
+    session = requests.Session()
+
+    try:
+
+        response = session.get(
+            url,
+            stream=True,
+            timeout=60,
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as exc:
+
+        raise RuntimeError(
+            f"Unable to connect to Google Drive: {exc}"
+        )
+
+
+    # --------------------------------------------------------------
+    # Google Drive large-file confirmation
+    # --------------------------------------------------------------
+
+    confirmation_token = None
+
+    for key, value in response.cookies.items():
+
+        if key.startswith("download_warning"):
+
+            confirmation_token = value
+            break
+
+
+    if confirmation_token:
+
+        url = (
+            "https://drive.google.com/uc"
+            f"?export=download"
+            f"&confirm={confirmation_token}"
+            f"&id={file_id}"
+        )
+
+        try:
+
+            response = session.get(
+                url,
+                stream=True,
+                timeout=60,
+            )
+
+            response.raise_for_status()
+
+        except requests.RequestException as exc:
+
+            raise RuntimeError(
+                f"Google Drive download confirmation failed: {exc}"
+            )
+
+
+    # --------------------------------------------------------------
+    # Save temporary file
+    # --------------------------------------------------------------
+
+    temporary_path = destination.with_suffix(
+        destination.suffix + ".download"
+    )
+
+    total_size = int(
+        response.headers.get(
+            "content-length",
+            0,
+        )
+    )
+
+    downloaded = 0
+
+    try:
+
+        with open(
+            temporary_path,
+            "wb",
+        ) as file:
+
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+
+                if not chunk:
+                    continue
+
+                file.write(chunk)
+
+                downloaded += len(chunk)
+
+                if total_size:
+
+                    percent = (
+                        downloaded / total_size
+                    ) * 100
+
+                    print(
+                        f"\rProgress: {percent:6.2f}%",
+                        end="",
+                        flush=True,
+                    )
+
+        print()
+
+        # ----------------------------------------------------------
+        # Basic validation
+        # ----------------------------------------------------------
+
+        if downloaded < 1024:
+
+            raise RuntimeError(
+                "Downloaded file is unexpectedly small. "
+                "Check Google Drive permissions and file ID."
+            )
+
+        # ----------------------------------------------------------
+        # Replace old file
+        # ----------------------------------------------------------
+
+        temporary_path.replace(destination)
+
+    except Exception:
+
+        if temporary_path.exists():
+
+            temporary_path.unlink()
+
+        raise
+
+
+    size_mb = downloaded / (
+        1024 * 1024
+    )
+
+    print(
+        f"✅ Model downloaded successfully "
+        f"({size_mb:.2f} MB)"
+    )
+
+
+# ======================================================================
+# ENSURE MODELS EXIST
+# ======================================================================
+
+def ensure_model_files():
+    """
+    Make sure both large model files exist locally.
+
+    GitHub stores the Python code and configuration.
+    Google Drive stores the large model files.
+    """
+
+    print("=" * 70)
+    print("CHECKING MODEL FILES")
+    print("=" * 70)
+
+
+    # --------------------------------------------------------------
+    # Binary model
+    # --------------------------------------------------------------
+
+    if BINARY_MODEL_PATH.exists():
+
+        size_mb = (
+            BINARY_MODEL_PATH.stat().st_size
+            / (1024 * 1024)
+        )
+
+        print(
+            f"✅ Binary model already exists "
+            f"({size_mb:.2f} MB)"
+        )
+
+    else:
+
+        print(
+            "⚠️ Binary model not found locally."
+        )
+
+        print(
+            "Downloading from Google Drive..."
+        )
+
+        download_from_google_drive(
+            BINARY_FILE_ID,
+            BINARY_MODEL_PATH,
+        )
+
+
+    # --------------------------------------------------------------
+    # Multi-class model
+    # --------------------------------------------------------------
+
+    if MULTICLASS_MODEL_PATH.exists():
+
+        size_mb = (
+            MULTICLASS_MODEL_PATH.stat().st_size
+            / (1024 * 1024)
+        )
+
+        print(
+            f"✅ Multi-class model already exists "
+            f"({size_mb:.2f} MB)"
+        )
+
+    else:
+
+        print(
+            "⚠️ Multi-class model not found locally."
+        )
+
+        print(
+            "Downloading from Google Drive..."
+        )
+
+        download_from_google_drive(
+            MULTICLASS_FILE_ID,
+            MULTICLASS_MODEL_PATH,
+        )
+
+
+    print()
+    print("✅ All model files are available.")
+
+
+# ======================================================================
+# JSON UTILITIES
 # ======================================================================
 
 def load_json(path: Path):
     """
-    Load JSON file.
+    Load JSON configuration file.
     """
 
     if not path.exists():
+
         raise FileNotFoundError(
-            f"Required file not found: {path}"
+            f"Required file not found:\n{path}"
         )
 
-    with open(path, "r", encoding="utf-8") as file:
-        return json.load(file)
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            return json.load(file)
+
+    except json.JSONDecodeError as exc:
+
+        raise ValueError(
+            f"Invalid JSON file: {path}\n{exc}"
+        )
 
 
-def normalize_feature_list(data) -> List[str]:
+# ======================================================================
+# FEATURE LIST NORMALIZATION
+# ======================================================================
+
+def normalize_feature_list(
+    data,
+) -> List[str]:
     """
-    Normalize different possible feature_names.json formats.
+    Normalize feature_names.json.
 
-    Supported examples:
+    Supported formats:
 
-        ["feature1", "feature2"]
+        [
+            "feature1",
+            "feature2"
+        ]
 
     or:
 
-        {"features": ["feature1", "feature2"]}
+        {
+            "features": [...]
+        }
 
+    or:
+
+        {
+            "feature_names": [...]
+        }
     """
 
     if isinstance(data, list):
-        return [str(x) for x in data]
+
+        return [
+            str(x)
+            for x in data
+        ]
+
 
     if isinstance(data, dict):
 
         if "features" in data:
-            return [str(x) for x in data["features"]]
+
+            return [
+                str(x)
+                for x in data["features"]
+            ]
+
 
         if "feature_names" in data:
-            return [str(x) for x in data["feature_names"]]
 
-        # Sometimes JSON may contain:
-        # {"0": "feature1", "1": "feature2"}
+            return [
+                str(x)
+                for x in data["feature_names"]
+            ]
 
+
+        # Numeric dictionary keys
         try:
+
             ordered_items = sorted(
                 data.items(),
-                key=lambda item: int(item[0])
+                key=lambda item: int(item[0]),
             )
 
-            return [str(value) for _, value in ordered_items]
+            return [
+                str(value)
+                for _, value in ordered_items
+            ]
 
         except Exception:
+
             pass
+
 
     raise ValueError(
         "Unsupported feature_names.json format."
     )
 
 
-def normalize_label_mapping(data) -> Dict[str, str]:
+# ======================================================================
+# LABEL MAPPING
+# ======================================================================
+
+def normalize_label_mapping(
+    data,
+) -> Dict[str, str]:
     """
-    Normalize label mapping.
-
-    Expected:
-
-        {
-            "0": "BENIGN",
-            "1": "DoS",
-            ...
-        }
-
+    Normalize attack label mapping.
     """
 
     if not isinstance(data, dict):
+
         raise ValueError(
-            "label_mapping.json must contain a JSON object."
+            "label_mapping.json must contain "
+            "a JSON object."
         )
 
     return {
@@ -225,10 +572,11 @@ def normalize_label_mapping(data) -> Dict[str, str]:
     }
 
 
+# ======================================================================
+# LOAD MODELS
+# ======================================================================
+
 def load_models():
-    """
-    Load both trained Random Forest models and configurations.
-    """
 
     global binary_model
     global multiclass_model
@@ -236,37 +584,57 @@ def load_models():
     global multiclass_features
     global label_mapping
 
+
+    print()
     print("=" * 70)
     print("AI-NIDS — LOADING MODELS")
     print("=" * 70)
 
-    # --------------------------------------------------------------
-    # Binary model
-    # --------------------------------------------------------------
 
-    print("\nLoading Binary Random Forest...")
+    # ==============================================================
+    # STEP 1 — ENSURE MODELS
+    # ==============================================================
 
-    if not BINARY_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Binary model not found:\n{BINARY_MODEL_PATH}"
+    ensure_model_files()
+
+
+    # ==============================================================
+    # STEP 2 — BINARY MODEL
+    # ==============================================================
+
+    print()
+    print("Loading Binary Random Forest...")
+
+    try:
+
+        binary_model = joblib.load(
+            BINARY_MODEL_PATH
         )
 
-    binary_model = joblib.load(BINARY_MODEL_PATH)
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Failed to load binary model:\n{exc}"
+        )
 
     print("✅ Binary model loaded.")
 
-    # --------------------------------------------------------------
-    # Binary feature list
-    # --------------------------------------------------------------
 
-    print("\nLoading binary feature list...")
+    # ==============================================================
+    # STEP 3 — BINARY FEATURES
+    # ==============================================================
+
+    print()
+    print("Loading binary feature list...")
 
     binary_feature_data = load_json(
         BINARY_FEATURES_PATH
     )
 
-    binary_features = normalize_feature_list(
-        binary_feature_data
+    binary_features = (
+        normalize_feature_list(
+            binary_feature_data
+        )
     )
 
     print(
@@ -274,36 +642,44 @@ def load_models():
         f"{len(binary_features)}"
     )
 
-    # --------------------------------------------------------------
-    # Multi-class model
-    # --------------------------------------------------------------
 
-    print("\nLoading Multi-class Random Forest...")
+    # ==============================================================
+    # STEP 4 — MULTI-CLASS MODEL
+    # ==============================================================
 
-    if not MULTICLASS_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Multi-class model not found:\n"
-            f"{MULTICLASS_MODEL_PATH}"
+    print()
+    print("Loading Multi-class Random Forest...")
+
+    try:
+
+        multiclass_model = joblib.load(
+            MULTICLASS_MODEL_PATH
         )
 
-    multiclass_model = joblib.load(
-        MULTICLASS_MODEL_PATH
-    )
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Failed to load multi-class model:\n{exc}"
+        )
 
     print("✅ Multi-class model loaded.")
 
-    # --------------------------------------------------------------
-    # Multi-class feature list
-    # --------------------------------------------------------------
 
-    print("\nLoading multi-class feature list...")
+    # ==============================================================
+    # STEP 5 — MULTI-CLASS FEATURES
+    # ==============================================================
+
+    print()
+    print("Loading multi-class feature list...")
 
     multiclass_feature_data = load_json(
         MULTICLASS_FEATURES_PATH
     )
 
-    multiclass_features = normalize_feature_list(
-        multiclass_feature_data
+    multiclass_features = (
+        normalize_feature_list(
+            multiclass_feature_data
+        )
     )
 
     print(
@@ -311,25 +687,30 @@ def load_models():
         f"{len(multiclass_features)}"
     )
 
-    # --------------------------------------------------------------
-    # Label mapping
-    # --------------------------------------------------------------
 
-    print("\nLoading label mapping...")
+    # ==============================================================
+    # STEP 6 — LABEL MAPPING
+    # ==============================================================
+
+    print()
+    print("Loading label mapping...")
 
     label_mapping_data = load_json(
-        LABEL_MAPPING_PATH
+        MULTICLASS_LABEL_MAPPING_PATH
     )
 
-    label_mapping = normalize_label_mapping(
-        label_mapping_data
+    label_mapping = (
+        normalize_label_mapping(
+            label_mapping_data
+        )
     )
 
     print("✅ Label mapping loaded.")
 
-    # --------------------------------------------------------------
-    # Validate feature lists
-    # --------------------------------------------------------------
+
+    # ==============================================================
+    # STEP 7 — VALIDATION
+    # ==============================================================
 
     if binary_features != multiclass_features:
 
@@ -337,33 +718,51 @@ def load_models():
             "Binary and multi-class feature lists do not match."
         )
 
-    if len(binary_features) != 50:
 
-        print(
-            f"⚠️ Warning: expected 50 features, "
-            f"found {len(binary_features)}."
+    if len(binary_features) != EXPECTED_FEATURE_COUNT:
+
+        raise ValueError(
+            f"Expected {EXPECTED_FEATURE_COUNT} "
+            f"features but found "
+            f"{len(binary_features)}."
         )
 
-    print("\n" + "=" * 70)
+
+    if not label_mapping:
+
+        raise ValueError(
+            "Attack label mapping is empty."
+        )
+
+
+    print()
+    print("=" * 70)
     print("MODEL LOADING COMPLETE")
     print("=" * 70)
 
     print(
-        f"Binary features:      {len(binary_features)}"
+        f"Binary features:      "
+        f"{len(binary_features)}"
     )
 
     print(
-        f"Multi-class features: {len(multiclass_features)}"
+        f"Multi-class features: "
+        f"{len(multiclass_features)}"
     )
 
     print(
-        f"Attack classes:       {len(label_mapping)}"
+        f"Attack classes:       "
+        f"{len(label_mapping)}"
     )
 
-    print("\nLabel mapping:")
+    print()
+    print("Label mapping:")
 
     for key, value in label_mapping.items():
-        print(f"  {key} -> {value}")
+
+        print(
+            f"  {key} -> {value}"
+        )
 
     print("=" * 70)
 
@@ -374,36 +773,38 @@ def load_models():
 
 @app.on_event("startup")
 def startup_event():
-    """
-    Load models when FastAPI starts.
-    """
 
     load_models()
 
 
 # ======================================================================
-# FEATURE VALIDATION
+# FEATURE PREPARATION
 # ======================================================================
 
 def prepare_features(
     feature_dict: Dict[str, float]
 ) -> pd.DataFrame:
     """
-    Validate and prepare the 50 input features.
-
-    The model receives columns in exactly the same
-    order used during training.
+    Validate and prepare the 50 model features.
     """
 
     if not binary_features:
+
         raise RuntimeError(
             "Models are not loaded."
         )
 
+
     expected_features = binary_features
 
-    provided_features = set(feature_dict.keys())
-    expected_set = set(expected_features)
+    provided_features = set(
+        feature_dict.keys()
+    )
+
+    expected_set = set(
+        expected_features
+    )
+
 
     # --------------------------------------------------------------
     # Missing features
@@ -429,6 +830,7 @@ def prepare_features(
             },
         )
 
+
     # --------------------------------------------------------------
     # Extra features
     # --------------------------------------------------------------
@@ -447,6 +849,7 @@ def prepare_features(
             },
         )
 
+
     # --------------------------------------------------------------
     # Numeric validation
     # --------------------------------------------------------------
@@ -458,8 +861,13 @@ def prepare_features(
         value = feature_dict[feature]
 
         try:
+
             numeric_value = float(value)
-        except (TypeError, ValueError):
+
+        except (
+            TypeError,
+            ValueError,
+        ):
 
             raise HTTPException(
                 status_code=422,
@@ -470,29 +878,30 @@ def prepare_features(
                 },
             )
 
-        if not np.isfinite(numeric_value):
+
+        if not np.isfinite(
+            numeric_value
+        ):
 
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "error": "Feature value must be finite",
+                    "error": (
+                        "Feature value must be finite"
+                    ),
                     "feature": feature,
                     "value": str(value),
                 },
             )
 
+
         values[feature] = numeric_value
 
-    # --------------------------------------------------------------
-    # Create DataFrame in training order
-    # --------------------------------------------------------------
 
-    dataframe = pd.DataFrame(
+    return pd.DataFrame(
         [values],
-        columns=expected_features
+        columns=expected_features,
     )
-
-    return dataframe
 
 
 # ======================================================================
@@ -502,45 +911,44 @@ def prepare_features(
 def predict_flow(
     feature_dict: Dict[str, float]
 ):
-    """
-    Execute the two-stage AI-NIDS prediction pipeline.
-
-    Stage 1:
-        Binary Random Forest
-
-    Stage 2:
-        Multi-class Random Forest
-        ONLY when Stage 1 predicts ATTACK.
-    """
 
     dataframe = prepare_features(
         feature_dict
     )
 
+
     # ==============================================================
-    # STAGE 1 — BINARY CLASSIFICATION
+    # STAGE 1 — BINARY
     # ==============================================================
 
-    binary_prediction = binary_model.predict(
-        dataframe
-    )[0]
+    binary_prediction = (
+        binary_model.predict(
+            dataframe
+        )[0]
+    )
 
     binary_probabilities = (
-        binary_model.predict_proba(dataframe)[0]
+        binary_model.predict_proba(
+            dataframe
+        )[0]
     )
 
     binary_classes = list(
         binary_model.classes_
     )
 
-    # Probability of the predicted class
-    binary_class_index = binary_classes.index(
-        binary_prediction
+    binary_class_index = (
+        binary_classes.index(
+            binary_prediction
+        )
     )
 
     binary_confidence = float(
-        binary_probabilities[binary_class_index]
+        binary_probabilities[
+            binary_class_index
+        ]
     )
+
 
     # ==============================================================
     # BENIGN
@@ -557,24 +965,31 @@ def predict_flow(
             "attack_confidence": None,
         }
 
+
     # ==============================================================
-    # STAGE 2 — MULTI-CLASS ATTACK CLASSIFICATION
+    # STAGE 2 — MULTI-CLASS
     # ==============================================================
 
     multiclass_prediction = (
-        multiclass_model.predict(dataframe)[0]
+        multiclass_model.predict(
+            dataframe
+        )[0]
     )
 
     multiclass_probabilities = (
-        multiclass_model.predict_proba(dataframe)[0]
+        multiclass_model.predict_proba(
+            dataframe
+        )[0]
     )
 
     multiclass_classes = list(
         multiclass_model.classes_
     )
 
-    multiclass_class_index = multiclass_classes.index(
-        multiclass_prediction
+    multiclass_class_index = (
+        multiclass_classes.index(
+            multiclass_prediction
+        )
     )
 
     attack_confidence = float(
@@ -583,14 +998,32 @@ def predict_flow(
         ]
     )
 
+
     # --------------------------------------------------------------
-    # Convert numeric class to attack name
+    # Numeric prediction → attack name
     # --------------------------------------------------------------
 
+    try:
+
+        attack_key = str(
+            int(multiclass_prediction)
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        attack_key = str(
+            multiclass_prediction
+        )
+
+
     attack_type = label_mapping.get(
-        str(int(multiclass_prediction)),
-        str(multiclass_prediction)
+        attack_key,
+        attack_key,
     )
+
 
     return {
         "is_attack": True,
@@ -603,7 +1036,7 @@ def predict_flow(
 
 
 # ======================================================================
-# ROOT ENDPOINT
+# ROOT
 # ======================================================================
 
 @app.get("/")
@@ -612,7 +1045,7 @@ def root():
     return {
         "service": "AI-NIDS",
         "status": "running",
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "architecture": (
             "Binary Random Forest → "
             "Multi-class Random Forest"
@@ -623,17 +1056,26 @@ def root():
 
 
 # ======================================================================
-# HEALTH ENDPOINT
+# HEALTH
 # ======================================================================
 
 @app.get(
     "/health",
-    response_model=HealthResponse
+    response_model=HealthResponse,
 )
 def health():
 
+    models_ready = (
+        binary_model is not None
+        and multiclass_model is not None
+    )
+
     return {
-        "status": "healthy",
+        "status": (
+            "healthy"
+            if models_ready
+            else "unhealthy"
+        ),
         "service": "AI-NIDS",
         "binary_model_loaded": (
             binary_model is not None
@@ -641,7 +1083,9 @@ def health():
         "multiclass_model_loaded": (
             multiclass_model is not None
         ),
-        "feature_count": len(binary_features),
+        "feature_count": len(
+            binary_features
+        ),
     }
 
 
@@ -651,7 +1095,7 @@ def health():
 
 @app.get(
     "/model-info",
-    response_model=ModelInfoResponse
+    response_model=ModelInfoResponse,
 )
 def model_info():
 
@@ -662,12 +1106,9 @@ def model_info():
 
         raise HTTPException(
             status_code=503,
-            detail="Models are not loaded."
+            detail="Models are not loaded.",
         )
 
-    attack_classes = list(
-        label_mapping.values()
-    )
 
     return {
         "binary_model": (
@@ -679,7 +1120,9 @@ def model_info():
         "feature_count": len(
             binary_features
         ),
-        "attack_classes": attack_classes,
+        "attack_classes": list(
+            label_mapping.values()
+        ),
         "architecture": (
             "Binary Random Forest → "
             "Multi-class Random Forest"
@@ -688,15 +1131,15 @@ def model_info():
 
 
 # ======================================================================
-# PREDICTION ENDPOINT
+# PREDICT
 # ======================================================================
 
 @app.post(
     "/predict",
-    response_model=PredictionResponse
+    response_model=PredictionResponse,
 )
 def predict(
-    request: PredictionRequest
+    request: PredictionRequest,
 ):
 
     if (
@@ -706,20 +1149,24 @@ def predict(
 
         raise HTTPException(
             status_code=503,
-            detail="AI models are not loaded."
+            detail="AI models are not loaded.",
         )
 
+
     start_time = time.perf_counter()
+
 
     result = predict_flow(
         request.features
     )
 
+
     elapsed = (
-        time.perf_counter() - start_time
+        time.perf_counter()
+        - start_time
     )
 
-    # Add internal timing information to console
+
     print(
         f"Prediction completed in "
         f"{elapsed * 1000:.2f} ms | "
@@ -727,11 +1174,12 @@ def predict(
         f"{result['attack_type']}"
     )
 
+
     return result
 
 
 # ======================================================================
-# FEATURE LIST ENDPOINT
+# FEATURES
 # ======================================================================
 
 @app.get("/features")
@@ -741,8 +1189,12 @@ def get_features():
 
         raise HTTPException(
             status_code=503,
-            detail="Feature configuration not loaded."
+            detail=(
+                "Feature configuration "
+                "not loaded."
+            ),
         )
+
 
     return {
         "count": len(binary_features),
@@ -751,7 +1203,7 @@ def get_features():
 
 
 # ======================================================================
-# ATTACK CLASSES ENDPOINT
+# ATTACK CLASSES
 # ======================================================================
 
 @app.get("/attack-classes")
@@ -761,8 +1213,12 @@ def get_attack_classes():
 
         raise HTTPException(
             status_code=503,
-            detail="Label mapping not loaded."
+            detail=(
+                "Label mapping "
+                "not loaded."
+            ),
         )
+
 
     return {
         "count": len(label_mapping),
@@ -771,34 +1227,41 @@ def get_attack_classes():
 
 
 # ======================================================================
-# SERVER INFORMATION
+# SERVER
 # ======================================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
+
     print()
     print("=" * 70)
     print("AI-NIDS FASTAPI SERVER")
     print("=" * 70)
+
     print()
     print("Starting server...")
+
     print()
     print("API:")
     print("  http://127.0.0.1:8000")
+
     print()
     print("Swagger documentation:")
     print("  http://127.0.0.1:8000/docs")
+
     print()
     print("ReDoc:")
     print("  http://127.0.0.1:8000/redoc")
+
     print()
     print("=" * 70)
 
+
     uvicorn.run(
         app,
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=8000,
         reload=False,
     )
