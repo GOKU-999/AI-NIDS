@@ -1,0 +1,30 @@
+{
+  "model": "RandomForestClassifier",
+  "task": "multiclass_attack_classification",
+  "num_classes": 9,
+  "classes": [
+    "BENIGN",
+    "DoS",
+    "DDoS",
+    "PortScan",
+    "BruteForce",
+    "WebAttack",
+    "Botnet",
+    "Infiltration",
+    "Heartbleed"
+  ],
+  "features": 50,
+  "training_samples": 2016638,
+  "testing_samples": 504160,
+  "n_estimators": 200,
+  "class_weight": "balanced",
+  "random_state": 42,
+  "training_time_seconds": 238.63372039794922,
+  "accuracy": 0.9988674230403046,
+  "macro_precision": 0.9618148064778987,
+  "macro_recall": 0.9304484226962716,
+  "macro_f1": 0.9310000499642174,
+  "weighted_precision": 0.998964339410136,
+  "weighted_recall": 0.9988674230403046,
+  "weighted_f1": 0.99889609164847
+}
