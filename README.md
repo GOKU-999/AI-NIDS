@@ -1,10 +1,4 @@
-# 📄 Complete README.md for AI-NIDS
 
-Here's your **complete, professional README** with all the updated information for GitHub + Google Drive setup:
-
----
-
-```markdown
 # 🛡️ AI-Powered Network Intrusion Detection System (AI-NIDS)
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
