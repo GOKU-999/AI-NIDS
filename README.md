@@ -38,3 +38,26 @@ AI-NIDS is a complete security analytics platform that uses Machine Learning to 
 | 8 | Heartbleed | Heartbleed exploit |
 
 ## 🏗️ Architecture
+
+
+## 🛠️ Tech Stack
+
+### Backend
+- **Framework**: FastAPI
+- **ML**: Scikit-learn, XGBoost
+- **Database**: PostgreSQL (or SQLite)
+- **Testing**: Pytest
+
+### Frontend
+- **Framework**: React 18
+- **UI Library**: Material-UI
+- **Charts**: Recharts
+- **HTTP Client**: Axios
+
+## 🚀 Quick Start
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/yourusername/AI-NIDS.git
+cd AI-NIDS
